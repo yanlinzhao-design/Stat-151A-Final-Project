@@ -159,5 +159,104 @@ model_multinom <- multinom(factor(Q49) ~ ., data = train_data, maxit = 500)
 ### Sensitivity Analyses
 
 ```{r}
+library(glmnet)
+library(dplyr)
+
+rmse <- function(y, yhat) sqrt(mean((y - yhat)^2))
+mae  <- function(y, yhat) mean(abs(y - yhat))
+
+set.seed(123)
+n <- nrow(X)
+train_indices <- sample(1:n, size = round(0.7 * n))
+X_train <- X[train_indices, ]
+y_train <- y[train_indices]
+X_test  <- X[-train_indices, ]
+y_test  <- y[-train_indices]
+
+cv_lasso <- cv.glmnet(X_train, y_train, alpha = 1)
+
+pred_1se <- as.numeric(predict(cv_lasso, newx = X_test, s = "lambda.1se"))
+pred_min <- as.numeric(predict(cv_lasso, newx = X_test, s = "lambda.min"))
+
+lambda_perf <- data.frame(
+  lambda_rule = c("lambda.1se", "lambda.min"),
+  RMSE = c(rmse(y_test, pred_1se), rmse(y_test, pred_min)),
+  MAE  = c(mae(y_test, pred_1se),  mae(y_test, pred_min))
+)
+
+coef_1se <- coef(cv_lasso, s = "lambda.1se")
+coef_min <- coef(cv_lasso, s = "lambda.min")
+
+vars_1se <- setdiff(rownames(coef_1se)[as.vector(coef_1se != 0)], "(Intercept)")
+vars_min <- setdiff(rownames(coef_min)[as.vector(coef_min != 0)], "(Intercept)")
+
+jaccard_overlap <- length(intersect(vars_1se, vars_min)) / length(union(vars_1se, vars_min))
+
+print(lambda_perf)
+length(vars_1se)
+length(vars_min)
+jaccard_overlap
+
+seeds <- 1:30
+split_df <- bind_rows(lapply(seeds, function(s) {
+  set.seed(s)
+  n <- nrow(X)
+  tr <- sample(1:n, size = round(0.7 * n))
+  X_tr <- X[tr, ]; y_tr <- y[tr]
+  X_te <- X[-tr, ]; y_te <- y[-tr]
+
+  cv_fit <- cv.glmnet(X_tr, y_tr, alpha = 1)
+  yhat <- as.numeric(predict(cv_fit, newx = X_te, s = "lambda.1se"))
+  nsel <- sum(coef(cv_fit, s = "lambda.1se") != 0) - 1
+
+  data.frame(
+    seed = s,
+    RMSE = rmse(y_te, yhat),
+    MAE  = mae(y_te, yhat),
+    n_selected = nsel
+  )
+}))
+
+split_df %>%
+  summarize(
+    RMSE_mean = mean(RMSE), RMSE_sd = sd(RMSE),
+    MAE_mean  = mean(MAE),  MAE_sd  = sd(MAE),
+    nsel_mean = mean(n_selected), nsel_sd = sd(n_selected)
+  )
+
+sensitive_vars <- c("Q260","Q262","Q273","Q240","Q150")
+sens_in_data <- intersect(sensitive_vars, colnames(X))
+
+run_lasso_once <- function(Xmat, yvec, seed = 123) {
+  set.seed(seed)
+  n <- nrow(Xmat)
+  tr <- sample(1:n, size = round(0.7 * n))
+  X_tr <- Xmat[tr, ]; y_tr <- yvec[tr]
+  X_te <- Xmat[-tr, ]; y_te <- yvec[-tr]
+
+  cv_fit <- cv.glmnet(X_tr, y_tr, alpha = 1)
+  yhat <- as.numeric(predict(cv_fit, newx = X_te, s = "lambda.1se"))
+  nsel <- sum(coef(cv_fit, s = "lambda.1se") != 0) - 1
+
+  data.frame(
+    RMSE = rmse(y_te, yhat),
+    MAE  = mae(y_te, yhat),
+    n_selected = nsel
+  )
+}
+
+full_perf <- run_lasso_once(X, y)
+
+if (length(sens_in_data) > 0) {
+  X_nosens <- X[, setdiff(colnames(X), sens_in_data), drop = FALSE]
+  nosens_perf <- run_lasso_once(X_nosens, y)
+  rbind(
+    data.frame(model = "All variables", full_perf),
+    data.frame(model = "Exclude sensitive vars", nosens_perf)
+  )
+} else {
+  data.frame(model = "All variables", full_perf)
+}
+
 # use privacy and interest to conduct sensitivity analyses / check robustness of results
 ```
