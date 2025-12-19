@@ -10,11 +10,12 @@ editor: visual
 # libraries/packages (ADD MORE depending on how we do rest of analysis)
 library(readr)
 library(MASS)
+install.packages("glmnet")
 library(glmnet)
 library(dplyr)
 
 # WVS data
-wvs <- read_csv("Resources/WVS_Cross-National_Wave_7_csv_v6_0.csv")
+wvs <- read_csv("WVS_Cross-National_Wave_7_csv_v6_0.csv")
 ```
 
 ### LASSO Variable Selection
@@ -28,7 +29,7 @@ questions <- wvs %>% select(starts_with("Q"), -Q49)
 wvs_clean <- na.omit(cbind(life_satisfaction, questions))
 
 # X as matrix, Y as vector
-y <- wvs_clean$Q49
+y <- wvs_clean[, 1]
 X <- as.matrix(wvs_clean[, -1])
 
 #split training and test data
@@ -56,65 +57,156 @@ selected_vars
 
 ```
 
-### Fitting Models
+### Proportional Odds Model
 
 ```{r}
-# May not ever need intercept, consider removing it from selected_vars entirely
-selected_var_names <- selected_vars$Question[selected_vars$Question != "(Intercept)"]
-
-# create training and test dataframes
-train_data <- data.frame(
-  Q49 = y_train,
-  X_train[, selected_var_names]
-)
-
-test_data <- data.frame(
-  Q49 = y_test,
-  X_test[, selected_var_names]
-)
-
-# fit model 1: Linear Regression
-lm <- lm(Q49 ~ ., data = train_data)
-
-# fit model 2: Proportional Odds
-po <- polr(factor(Q49) ~ ., data = train_data)
-
-#summarize optional, output is very long
-```
-
-### Diagnostics
-
-```{r}
-# Linear model diagnostics
-par(mfrow = c(2, 2))
-plot(lm)
-par(mfrow = c(1, 1))
-```
-
-### Evaluate on Test Set
-
-```{r}
-# predictions
-pred_lm <- predict(lm, newdata = test_data)
-pred_po <- as.numeric(as.character(predict(po, newdata = test_data)))
-
-# metrics
-mae_lm <- mean(abs(pred_lm - test_data$Q49))
-mae_po <- mean(abs(pred_po - test_data$Q49))
-
-rmse_lm <- sqrt(mean((pred_lm - test_data$Q49)^2))
-rmse_po <- sqrt(mean((pred_po - test_data$Q49)^2))
-
-# display comparison
-data.frame(
-  Model = c("Linear", "Proportional Odds"),
-  Mean_Absolute_Error = c(mae_lm, mae_po),
-  Root_Mean_Square_Error = c(rmse_lm, rmse_po)
-)
+# as opposed to linear (maybe compare predictive accuracy to linear model and discuss in writeup)
 ```
 
 ### Sensitivity Analyses
 
 ```{r}
+library(glmnet)
+library(dplyr)
+
+# ---------------------------
+# helper functions
+# ---------------------------
+rmse <- function(y, yhat) sqrt(mean((y - yhat)^2))
+mae  <- function(y, yhat) mean(abs(y - yhat))
+
+# ---------------------------
+# (Reuse your same y, X from above)
+# life_satisfaction = wvs["Q49"]
+# questions <- wvs %>% select(starts_with("Q"), -Q49)
+# wvs_clean <- na.omit(cbind(life_satisfaction, questions))
+# y <- wvs_clean[, 1]
+# X <- as.matrix(wvs_clean[, -1])
+# ---------------------------
+
+# NOTE: fix small bug in your split (you set y_test incorrectly)
+set.seed(123)
+n <- nrow(X)
+train_indices <- sample(1:n, size = round(0.7 * n))
+X_train <- X[train_indices, ]
+y_train <- y[train_indices]
+X_test  <- X[-train_indices, ]
+y_test  <- y[-train_indices]   # <-- fix
+
+# Fit CV LASSO once on baseline split
+set.seed(123)
+cv_lasso <- cv.glmnet(X_train, y_train, alpha = 1)
+
+# =========================================================
+# A) Sensitivity to lambda choice: lambda.1se vs lambda.min
+# =========================================================
+pred_1se <- as.numeric(predict(cv_lasso, newx = X_test, s = "lambda.1se"))
+pred_min <- as.numeric(predict(cv_lasso, newx = X_test, s = "lambda.min"))
+
+lambda_perf <- data.frame(
+  lambda_rule = c("lambda.1se", "lambda.min"),
+  RMSE = c(rmse(y_test, pred_1se), rmse(y_test, pred_min)),
+  MAE  = c(mae(y_test, pred_1se),  mae(y_test, pred_min))
+)
+
+# number of selected variables + overlap
+coef_1se <- coef(cv_lasso, s = "lambda.1se")
+coef_min <- coef(cv_lasso, s = "lambda.min")
+
+vars_1se <- rownames(coef_1se)[as.vector(coef_1se != 0)]
+vars_min <- rownames(coef_min)[as.vector(coef_min != 0)]
+vars_1se <- setdiff(vars_1se, "(Intercept)")
+vars_min <- setdiff(vars_min, "(Intercept)")
+
+jaccard_overlap <- length(intersect(vars_1se, vars_min)) / length(union(vars_1se, vars_min))
+
+cat("=== Lambda sensitivity ===\n")
+print(lambda_perf)
+cat("# vars (lambda.1se):", length(vars_1se), "\n")
+cat("# vars (lambda.min):", length(vars_min), "\n")
+cat("Jaccard overlap:", round(jaccard_overlap, 3), "\n\n")
+
+# =========================================================
+# B) Sensitivity to random split (seed stability)
+# =========================================================
+seeds <- 1:30
+
+split_results <- lapply(seeds, function(s) {
+  set.seed(s)
+  n <- nrow(X)
+  tr <- sample(1:n, size = round(0.7 * n))
+  X_tr <- X[tr, ]; y_tr <- y[tr]
+  X_te <- X[-tr, ]; y_te <- y[-tr]
+
+  cv_fit <- cv.glmnet(X_tr, y_tr, alpha = 1)
+  yhat <- as.numeric(predict(cv_fit, newx = X_te, s = "lambda.1se"))
+
+  nsel <- sum(coef(cv_fit, s = "lambda.1se") != 0) - 1  # remove intercept
+  data.frame(seed = s,
+             RMSE = rmse(y_te, yhat),
+             MAE  = mae(y_te, yhat),
+             n_selected = nsel)
+})
+
+split_df <- bind_rows(split_results)
+
+split_summary <- split_df %>%
+  summarize(
+    RMSE_mean = mean(RMSE), RMSE_sd = sd(RMSE),
+    MAE_mean  = mean(MAE),  MAE_sd  = sd(MAE),
+    nsel_mean = mean(n_selected), nsel_sd = sd(n_selected)
+  )
+
+cat("=== Split sensitivity (30 random seeds) ===\n")
+print(split_summary)
+cat("\n")
+
+# =========================================================
+# C) Sensitivity to privacy: drop "sensitive" variables
+# =========================================================
+# Replace with actual Q-codes you decide are sensitive (religion/sexuality/politics/etc.)
+sensitive_vars <- c("Q260", "Q262", "Q273", "Q240", "Q150")
+
+# keep only those that exist in your dataset
+sens_in_data <- intersect(sensitive_vars, colnames(X))
+cat("Sensitive vars found:", paste(sens_in_data, collapse = ", "), "\n")
+
+run_lasso_once <- function(Xmat, yvec, seed = 123) {
+  set.seed(seed)
+  n <- nrow(Xmat)
+  tr <- sample(1:n, size = round(0.7 * n))
+  X_tr <- Xmat[tr, ]; y_tr <- yvec[tr]
+  X_te <- Xmat[-tr, ]; y_te <- yvec[-tr]
+
+  cv_fit <- cv.glmnet(X_tr, y_tr, alpha = 1)
+  yhat <- as.numeric(predict(cv_fit, newx = X_te, s = "lambda.1se"))
+
+  vars <- rownames(coef(cv_fit, s="lambda.1se"))[as.vector(coef(cv_fit, s="lambda.1se") != 0)]
+  vars <- setdiff(vars, "(Intercept)")
+
+  data.frame(RMSE = rmse(y_te, yhat),
+             MAE  = mae(y_te, yhat),
+             n_selected = length(vars))
+}
+
+# Full model
+full_perf <- run_lasso_once(X, y, seed = 123)
+
+# Remove sensitive variables
+if (length(sens_in_data) > 0) {
+  X_nosens <- X[, setdiff(colnames(X), sens_in_data), drop = FALSE]
+  nosens_perf <- run_lasso_once(X_nosens, y, seed = 123)
+
+  privacy_perf <- rbind(
+    data.frame(model = "All variables", full_perf),
+    data.frame(model = "Exclude sensitive vars", nosens_perf)
+  )
+} else {
+  privacy_perf <- data.frame(model = "All variables", full_perf)
+  cat("No sensitive vars matched your column names, so skipping exclusion.\n")
+}
+
+cat("=== Privacy sensitivity ===\n")
+print(privacy_perf)
 # use privacy and interest to conduct sensitivity analyses / check robustness of results
 ```
